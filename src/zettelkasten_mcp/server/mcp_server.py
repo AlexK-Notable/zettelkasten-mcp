@@ -7,6 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from sqlalchemy import exc as sqlalchemy_exc
 from mcp.server.fastmcp import Context, FastMCP
 from zettelkasten_mcp.config import config
+from zettelkasten_mcp.exceptions import (
+    ZettelkastenError,
+    NoteNotFoundError,
+    NoteValidationError,
+    LinkError,
+    StorageError,
+    ValidationError,
+)
 from zettelkasten_mcp.models.schema import LinkType, Note, NoteType, Tag
 from zettelkasten_mcp.observability import metrics, timed_operation, get_logger
 from zettelkasten_mcp.services.search_service import SearchService
@@ -41,29 +49,34 @@ class ZettelkastenMcpServer:
 
     def format_error_response(self, error: Exception) -> str:
         """Format an error response in a consistent way.
-        
+
         Args:
             error: The exception that occurred
-            
+
         Returns:
             Formatted error message with appropriate level of detail
         """
         # Generate a unique error ID for traceability in logs
         error_id = str(uuid.uuid4())[:8]
-        
-        if isinstance(error, ValueError):
-            # Domain validation errors - typically safe to show to users
+
+        if isinstance(error, ZettelkastenError):
+            # Structured domain errors - use the error code and message
+            logger.error(
+                f"[{error.code.name}] [{error_id}]: {error.message}",
+                extra={"error_details": error.details}
+            )
+            return f"Error: {error.message}"
+        elif isinstance(error, ValueError):
+            # Legacy domain validation errors - typically safe to show to users
             logger.error(f"Validation error [{error_id}]: {str(error)}")
             return f"Error: {str(error)}"
         elif isinstance(error, (IOError, OSError)):
             # File system errors - don't expose paths or detailed error messages
             logger.error(f"File system error [{error_id}]: {str(error)}", exc_info=True)
-            # return f"Unable to access the requested resource. Error ID: {error_id}"
             return f"Error: {str(error)}"
         else:
             # Unexpected errors - log with full stack trace but return generic message
             logger.error(f"Unexpected error [{error_id}]: {str(error)}", exc_info=True)
-            # return f"An unexpected error occurred. Error ID: {error_id}"
             return f"Error: {str(error)}"
 
     def _register_tools(self) -> None:

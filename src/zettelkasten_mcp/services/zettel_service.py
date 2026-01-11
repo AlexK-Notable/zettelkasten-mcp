@@ -5,6 +5,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from zettelkasten_mcp.config import config
+from zettelkasten_mcp.exceptions import (
+    ErrorCode,
+    NoteNotFoundError,
+    NoteValidationError,
+    LinkError,
+    ValidationError,
+)
 from zettelkasten_mcp.models.schema import Link, LinkType, Note, NoteType, Tag
 from zettelkasten_mcp.storage.note_repository import NoteRepository
 
@@ -34,9 +41,17 @@ class ZettelService:
     ) -> Note:
         """Create a new note."""
         if not title:
-            raise ValueError("Title is required")
+            raise NoteValidationError(
+                "Title is required",
+                field="title",
+                code=ErrorCode.NOTE_TITLE_REQUIRED
+            )
         if not content:
-            raise ValueError("Content is required")
+            raise NoteValidationError(
+                "Content is required",
+                field="content",
+                code=ErrorCode.NOTE_CONTENT_REQUIRED
+            )
 
         # Create note object
         note = Note(
@@ -72,7 +87,7 @@ class ZettelService:
         """Update an existing note."""
         note = self.repository.get(note_id)
         if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
+            raise NoteNotFoundError(note_id)
 
         # Update fields
         if title is not None:
@@ -113,15 +128,15 @@ class ZettelService:
         """Add a tag to a note."""
         note = self.repository.get(note_id)
         if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
+            raise NoteNotFoundError(note_id)
         note.add_tag(tag)
         return self.repository.update(note)
-    
+
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
         """Remove a tag from a note."""
         note = self.repository.get(note_id)
         if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
+            raise NoteNotFoundError(note_id)
         note.remove_tag(tag)
         return self.repository.update(note)
     
@@ -154,10 +169,10 @@ class ZettelService:
         """
         source_note = self.repository.get(source_id)
         if not source_note:
-            raise ValueError(f"Source note with ID {source_id} not found")
+            raise NoteNotFoundError(source_id, f"Source note with ID '{source_id}' not found")
         target_note = self.repository.get(target_id)
         if not target_note:
-            raise ValueError(f"Target note with ID {target_id} not found")
+            raise NoteNotFoundError(target_id, f"Target note with ID '{target_id}' not found")
         
         # Check if this link already exists before attempting to add it
         for link in source_note.links:
@@ -215,7 +230,7 @@ class ZettelService:
         """Remove a link between notes."""
         source_note = self.repository.get(source_id)
         if not source_note:
-            raise ValueError(f"Source note with ID {source_id} not found")
+            raise NoteNotFoundError(source_id, f"Source note with ID '{source_id}' not found")
         
         # Remove link from source to target
         source_note.remove_link(target_id, link_type)
@@ -237,7 +252,7 @@ class ZettelService:
         """Get notes linked to/from a note."""
         note = self.repository.get(note_id)
         if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
+            raise NoteNotFoundError(note_id)
         return self.repository.find_linked_notes(note_id, direction)
     
     def rebuild_index(self) -> None:
@@ -248,12 +263,16 @@ class ZettelService:
         """Export a note in the specified format."""
         note = self.repository.get(note_id)
         if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        
+            raise NoteNotFoundError(note_id)
+
         if format.lower() == "markdown":
             return note.to_markdown()
         else:
-            raise ValueError(f"Unsupported export format: {format}")
+            raise ValidationError(
+                f"Unsupported export format: {format}",
+                field="format",
+                value=format
+            )
     
     def sync_to_obsidian(self) -> int:
         """Sync all notes to the Obsidian vault.
@@ -270,7 +289,7 @@ class ZettelService:
         """Find notes similar to the given note based on shared tags and links."""
         note = self.repository.get(note_id)
         if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
+            raise NoteNotFoundError(note_id)
         
         # Get all notes
         all_notes = self.repository.get_all()
