@@ -842,6 +842,139 @@ class ZettelkastenMcpServer:
             except Exception as e:
                 return self.format_error_response(e)
 
+        # ========== Bulk Operations ==========
+
+        @self.mcp.tool(name="zk_bulk_create_notes")
+        def zk_bulk_create_notes(notes: str) -> str:
+            """Create multiple notes in a single batch operation.
+
+            All notes are created atomically - if any fails, all are rolled back.
+
+            Args:
+                notes: JSON array of note objects. Each must have:
+                    - title (required): Note title
+                    - content (required): Note content
+                    - note_type (optional): fleeting, literature, permanent, structure, hub
+                    - project (optional): Project name (default: "general")
+                    - tags (optional): Array of tag names
+            """
+            import json
+            with timed_operation("zk_bulk_create_notes") as op:
+                try:
+                    notes_data = json.loads(notes)
+                    if not isinstance(notes_data, list):
+                        return "Error: Input must be a JSON array of note objects."
+
+                    op["note_count"] = len(notes_data)
+                    created = self.zettel_service.bulk_create_notes(notes_data)
+
+                    output = f"Successfully created {len(created)} notes:\n\n"
+                    for note in created:
+                        output += f"- {note.title} (ID: {note.id})\n"
+
+                    return output
+                except json.JSONDecodeError as e:
+                    return f"Error: Invalid JSON - {e}"
+                except Exception as e:
+                    return self.format_error_response(e)
+
+        @self.mcp.tool(name="zk_bulk_delete_notes")
+        def zk_bulk_delete_notes(note_ids: str) -> str:
+            """Delete multiple notes in a single batch operation.
+
+            Args:
+                note_ids: Comma-separated list of note IDs to delete.
+            """
+            with timed_operation("zk_bulk_delete_notes") as op:
+                try:
+                    ids = [id.strip() for id in note_ids.split(",") if id.strip()]
+                    if not ids:
+                        return "Error: No note IDs provided."
+
+                    op["note_count"] = len(ids)
+                    deleted = self.zettel_service.bulk_delete_notes(ids)
+
+                    return f"Successfully deleted {deleted} notes."
+                except Exception as e:
+                    return self.format_error_response(e)
+
+        @self.mcp.tool(name="zk_bulk_add_tags")
+        def zk_bulk_add_tags(note_ids: str, tags: str) -> str:
+            """Add tags to multiple notes at once.
+
+            Args:
+                note_ids: Comma-separated list of note IDs.
+                tags: Comma-separated list of tags to add.
+            """
+            with timed_operation("zk_bulk_add_tags") as op:
+                try:
+                    ids = [id.strip() for id in note_ids.split(",") if id.strip()]
+                    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+                    if not ids:
+                        return "Error: No note IDs provided."
+                    if not tag_list:
+                        return "Error: No tags provided."
+
+                    op["note_count"] = len(ids)
+                    op["tag_count"] = len(tag_list)
+                    updated = self.zettel_service.bulk_add_tags(ids, tag_list)
+
+                    return f"Added tags [{', '.join(tag_list)}] to {updated} notes."
+                except Exception as e:
+                    return self.format_error_response(e)
+
+        @self.mcp.tool(name="zk_bulk_remove_tags")
+        def zk_bulk_remove_tags(note_ids: str, tags: str) -> str:
+            """Remove tags from multiple notes at once.
+
+            Args:
+                note_ids: Comma-separated list of note IDs.
+                tags: Comma-separated list of tags to remove.
+            """
+            with timed_operation("zk_bulk_remove_tags") as op:
+                try:
+                    ids = [id.strip() for id in note_ids.split(",") if id.strip()]
+                    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+                    if not ids:
+                        return "Error: No note IDs provided."
+                    if not tag_list:
+                        return "Error: No tags provided."
+
+                    op["note_count"] = len(ids)
+                    op["tag_count"] = len(tag_list)
+                    updated = self.zettel_service.bulk_remove_tags(ids, tag_list)
+
+                    return f"Removed tags [{', '.join(tag_list)}] from {updated} notes."
+                except Exception as e:
+                    return self.format_error_response(e)
+
+        @self.mcp.tool(name="zk_bulk_move_to_project")
+        def zk_bulk_move_to_project(note_ids: str, project: str) -> str:
+            """Move multiple notes to a different project.
+
+            Args:
+                note_ids: Comma-separated list of note IDs.
+                project: Target project name.
+            """
+            with timed_operation("zk_bulk_move_to_project") as op:
+                try:
+                    ids = [id.strip() for id in note_ids.split(",") if id.strip()]
+
+                    if not ids:
+                        return "Error: No note IDs provided."
+                    if not project or not project.strip():
+                        return "Error: Project name is required."
+
+                    op["note_count"] = len(ids)
+                    op["project"] = project.strip()
+                    updated = self.zettel_service.bulk_update_project(ids, project.strip())
+
+                    return f"Moved {updated} notes to project '{project}'."
+                except Exception as e:
+                    return self.format_error_response(e)
+
     def _register_resources(self) -> None:
         """Register MCP resources."""
         # Currently, we don't define resources for the Zettelkasten server

@@ -374,3 +374,100 @@ class ZettelService:
         # Sort by similarity (descending)
         results.sort(key=lambda x: x[1], reverse=True)
         return results
+
+    # ========== Bulk Operations ==========
+
+    def bulk_create_notes(
+        self,
+        notes_data: List[Dict[str, Any]]
+    ) -> List[Note]:
+        """Create multiple notes in a single batch operation.
+
+        Args:
+            notes_data: List of dictionaries with note data.
+                Each dict should have: title, content, note_type (optional),
+                project (optional), tags (optional list of strings).
+
+        Returns:
+            List of created Note objects.
+
+        Raises:
+            NoteValidationError: If any note fails validation.
+        """
+        notes = []
+        for data in notes_data:
+            if not data.get("title"):
+                raise NoteValidationError(
+                    "Title is required for all notes",
+                    field="title",
+                    code=ErrorCode.NOTE_TITLE_REQUIRED
+                )
+            if not data.get("content"):
+                raise NoteValidationError(
+                    "Content is required for all notes",
+                    field="content",
+                    code=ErrorCode.NOTE_CONTENT_REQUIRED
+                )
+
+            note_type = data.get("note_type", NoteType.PERMANENT)
+            if isinstance(note_type, str):
+                note_type = NoteType(note_type)
+
+            note = Note(
+                title=data["title"],
+                content=data["content"],
+                note_type=note_type,
+                project=data.get("project", "general"),
+                tags=[Tag(name=tag) for tag in data.get("tags", [])],
+                metadata=data.get("metadata", {})
+            )
+            notes.append(note)
+
+        return self.repository.bulk_create_notes(notes)
+
+    def bulk_delete_notes(self, note_ids: List[str]) -> int:
+        """Delete multiple notes in a single batch operation.
+
+        Args:
+            note_ids: List of note IDs to delete.
+
+        Returns:
+            Number of notes successfully deleted.
+        """
+        return self.repository.bulk_delete_notes(note_ids)
+
+    def bulk_add_tags(self, note_ids: List[str], tags: List[str]) -> int:
+        """Add tags to multiple notes.
+
+        Args:
+            note_ids: List of note IDs to update.
+            tags: List of tag names to add.
+
+        Returns:
+            Number of notes successfully updated.
+        """
+        return self.repository.bulk_add_tags(note_ids, tags)
+
+    def bulk_remove_tags(self, note_ids: List[str], tags: List[str]) -> int:
+        """Remove tags from multiple notes.
+
+        Args:
+            note_ids: List of note IDs to update.
+            tags: List of tag names to remove.
+
+        Returns:
+            Number of notes successfully updated.
+        """
+        return self.repository.bulk_remove_tags(note_ids, tags)
+
+    def bulk_update_project(self, note_ids: List[str], project: str) -> int:
+        """Move multiple notes to a different project.
+
+        Args:
+            note_ids: List of note IDs to update.
+            project: Target project name.
+
+        Returns:
+            Number of notes successfully updated.
+        """
+        return self.repository.bulk_update_project(note_ids, project)

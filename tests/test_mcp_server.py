@@ -463,3 +463,104 @@ Some content here.
         result = fts_search_func(query="nonexistent", limit=10, highlight=True)
 
         assert "No notes found" in result
+
+    # ========== Bulk Operations Tests ==========
+
+    def test_bulk_create_notes_tool(self):
+        """Test zk_bulk_create_notes tool."""
+        assert 'zk_bulk_create_notes' in self.registered_tools
+
+        # Create mock notes
+        mock_notes = [
+            MagicMock(id="note1", title="Note 1"),
+            MagicMock(id="note2", title="Note 2"),
+        ]
+        self.mock_zettel_service.bulk_create_notes.return_value = mock_notes
+
+        bulk_create_func = self.registered_tools['zk_bulk_create_notes']
+        json_input = '[{"title": "Note 1", "content": "Content 1"}, {"title": "Note 2", "content": "Content 2"}]'
+        result = bulk_create_func(notes=json_input)
+
+        assert "Successfully created 2 notes" in result
+        assert "Note 1" in result
+        assert "Note 2" in result
+
+    def test_bulk_create_notes_invalid_json(self):
+        """Test zk_bulk_create_notes with invalid JSON."""
+        assert 'zk_bulk_create_notes' in self.registered_tools
+
+        bulk_create_func = self.registered_tools['zk_bulk_create_notes']
+        result = bulk_create_func(notes="not valid json")
+
+        assert "Error: Invalid JSON" in result
+
+    def test_bulk_delete_notes_tool(self):
+        """Test zk_bulk_delete_notes tool."""
+        assert 'zk_bulk_delete_notes' in self.registered_tools
+
+        self.mock_zettel_service.bulk_delete_notes.return_value = 3
+
+        bulk_delete_func = self.registered_tools['zk_bulk_delete_notes']
+        result = bulk_delete_func(note_ids="note1, note2, note3")
+
+        assert "Successfully deleted 3 notes" in result
+        self.mock_zettel_service.bulk_delete_notes.assert_called_once()
+
+    def test_bulk_delete_notes_empty_ids(self):
+        """Test zk_bulk_delete_notes with empty IDs."""
+        assert 'zk_bulk_delete_notes' in self.registered_tools
+
+        bulk_delete_func = self.registered_tools['zk_bulk_delete_notes']
+        result = bulk_delete_func(note_ids="")
+
+        assert "Error:" in result
+        assert "No note IDs" in result
+
+    def test_bulk_add_tags_tool(self):
+        """Test zk_bulk_add_tags tool."""
+        assert 'zk_bulk_add_tags' in self.registered_tools
+
+        self.mock_zettel_service.bulk_add_tags.return_value = 2
+
+        bulk_add_tags_func = self.registered_tools['zk_bulk_add_tags']
+        result = bulk_add_tags_func(note_ids="note1, note2", tags="python, programming")
+
+        assert "Added tags" in result
+        assert "python" in result
+        assert "programming" in result
+        assert "2 notes" in result
+
+    def test_bulk_remove_tags_tool(self):
+        """Test zk_bulk_remove_tags tool."""
+        assert 'zk_bulk_remove_tags' in self.registered_tools
+
+        self.mock_zettel_service.bulk_remove_tags.return_value = 2
+
+        bulk_remove_tags_func = self.registered_tools['zk_bulk_remove_tags']
+        result = bulk_remove_tags_func(note_ids="note1, note2", tags="outdated")
+
+        assert "Removed tags" in result
+        assert "outdated" in result
+        assert "2 notes" in result
+
+    def test_bulk_move_to_project_tool(self):
+        """Test zk_bulk_move_to_project tool."""
+        assert 'zk_bulk_move_to_project' in self.registered_tools
+
+        self.mock_zettel_service.bulk_update_project.return_value = 3
+
+        bulk_move_func = self.registered_tools['zk_bulk_move_to_project']
+        result = bulk_move_func(note_ids="note1, note2, note3", project="research")
+
+        assert "Moved 3 notes" in result
+        assert "research" in result
+
+    def test_bulk_move_to_project_empty_project(self):
+        """Test zk_bulk_move_to_project with empty project."""
+        assert 'zk_bulk_move_to_project' in self.registered_tools
+
+        bulk_move_func = self.registered_tools['zk_bulk_move_to_project']
+        result = bulk_move_func(note_ids="note1", project="")
+
+        assert "Error:" in result
+        assert "Project name is required" in result
