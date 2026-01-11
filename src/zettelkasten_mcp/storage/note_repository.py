@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from zettelkasten_mcp.config import config
 from zettelkasten_mcp.models.db_models import (Base, DBLink, DBNote, DBTag,
-                                            get_session_factory, init_db)
+                                            get_session_factory, init_db,
+                                            rebuild_fts_index)
 from zettelkasten_mcp.models.schema import Link, LinkType, Note, NoteType, Tag, validate_safe_path_component
 from zettelkasten_mcp.storage.base import Repository
 
@@ -100,6 +101,10 @@ class NoteRepository(Repository[Note]):
             # Index notes
             for note in notes:
                 self._index_note(note)
+
+        # Rebuild FTS5 index to ensure full-text search is in sync
+        fts_count = self.rebuild_fts()
+        logger.info(f"Rebuilt FTS5 index with {fts_count} notes")
     
     def _parse_note_from_markdown(self, content: str) -> Note:
         """Parse a note from markdown content."""
@@ -705,7 +710,132 @@ class NoteRepository(Repository[Note]):
             if note:
                 notes.append(note)
         return notes
-    
+
+    def fts_search(
+        self,
+        query: str,
+        limit: int = 50,
+        highlight: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Full-text search using SQLite FTS5.
+
+        Performs efficient full-text search with BM25 ranking.
+
+        Args:
+            query: Search query. Supports FTS5 syntax:
+                   - Simple terms: "python async"
+                   - Phrases: '"async await"'
+                   - Boolean: "python AND NOT java"
+                   - Prefix: "program*"
+                   - Column filter: "title:python"
+            limit: Maximum number of results to return.
+            highlight: If True, include highlighted snippets in results.
+
+        Returns:
+            List of dicts with keys:
+                - id: Note ID
+                - title: Note title
+                - rank: BM25 relevance score (lower is better)
+                - snippet: Highlighted content snippet (if highlight=True)
+        """
+        results = []
+
+        with self.session_factory() as session:
+            # Escape the query for FTS5 (basic escaping)
+            # FTS5 uses double quotes for phrases
+            safe_query = query.replace('"', '""')
+
+            if highlight:
+                # Query with highlighted snippets
+                sql = text("""
+                    SELECT
+                        id,
+                        title,
+                        bm25(notes_fts) as rank,
+                        snippet(notes_fts, 2, '<mark>', '</mark>', '...', 32) as snippet
+                    FROM notes_fts
+                    WHERE notes_fts MATCH :query
+                    ORDER BY rank
+                    LIMIT :limit
+                """)
+            else:
+                # Query without snippets (faster)
+                sql = text("""
+                    SELECT
+                        id,
+                        title,
+                        bm25(notes_fts) as rank
+                    FROM notes_fts
+                    WHERE notes_fts MATCH :query
+                    ORDER BY rank
+                    LIMIT :limit
+                """)
+
+            try:
+                result = session.execute(sql, {"query": safe_query, "limit": limit})
+                rows = result.fetchall()
+
+                for row in rows:
+                    entry = {
+                        "id": row[0],
+                        "title": row[1],
+                        "rank": row[2],
+                    }
+                    if highlight and len(row) > 3:
+                        entry["snippet"] = row[3]
+                    results.append(entry)
+
+            except Exception as e:
+                # FTS5 query syntax errors
+                logger.warning(f"FTS5 search failed for query '{query}': {e}")
+                # Fall back to simple LIKE search
+                return self._fallback_text_search(query, limit)
+
+        return results
+
+    def _fallback_text_search(
+        self,
+        query: str,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Fallback text search using LIKE when FTS5 fails.
+
+        Used when FTS5 query syntax is invalid or FTS is unavailable.
+        """
+        results = []
+        search_term = f"%{query}%"
+
+        with self.session_factory() as session:
+            sql = text("""
+                SELECT id, title, content
+                FROM notes
+                WHERE title LIKE :term OR content LIKE :term
+                LIMIT :limit
+            """)
+            result = session.execute(sql, {"term": search_term, "limit": limit})
+            rows = result.fetchall()
+
+            for row in rows:
+                # Simple relevance: title match scores higher
+                title_match = query.lower() in row[1].lower() if row[1] else False
+                rank = -2.0 if title_match else -1.0
+
+                results.append({
+                    "id": row[0],
+                    "title": row[1],
+                    "rank": rank,
+                })
+
+        return results
+
+    def rebuild_fts(self) -> int:
+        """Rebuild the FTS5 index from the notes table.
+
+        Returns:
+            Number of notes indexed.
+        """
+        return rebuild_fts_index(self.engine)
+
     def find_by_tag(self, tag: Union[str, Tag]) -> List[Note]:
         """Find notes by tag."""
         tag_name = tag.name if isinstance(tag, Tag) else tag

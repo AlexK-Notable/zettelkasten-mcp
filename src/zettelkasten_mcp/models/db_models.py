@@ -103,7 +103,94 @@ def init_db() -> None:
     # Create engine based on configuration
     engine = create_engine(config.get_db_url())
     Base.metadata.create_all(engine)
+
+    # Create FTS5 virtual table for full-text search
+    init_fts5(engine)
+
     return engine
+
+
+def init_fts5(engine) -> None:
+    """Initialize FTS5 full-text search virtual table.
+
+    Creates an FTS5 virtual table that mirrors the notes table for
+    efficient full-text search with BM25 ranking.
+    """
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        # Create FTS5 virtual table for notes (if not exists)
+        # We use content="" for an external content table - we'll manually sync
+        conn.execute(text("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                id UNINDEXED,
+                title,
+                content,
+                content='notes',
+                content_rowid='rowid'
+            )
+        """))
+
+        # Create triggers to keep FTS in sync with notes table
+        # Note: We need to handle inserts, updates, and deletes
+
+        # Trigger for INSERT - add to FTS
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+                INSERT INTO notes_fts(rowid, id, title, content)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+            END
+        """))
+
+        # Trigger for DELETE - remove from FTS
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+                INSERT INTO notes_fts(notes_fts, rowid, id, title, content)
+                VALUES ('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+            END
+        """))
+
+        # Trigger for UPDATE - update FTS
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+                INSERT INTO notes_fts(notes_fts, rowid, id, title, content)
+                VALUES ('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+                INSERT INTO notes_fts(rowid, id, title, content)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+            END
+        """))
+
+        conn.commit()
+
+def rebuild_fts_index(engine) -> int:
+    """Rebuild the FTS5 index from existing notes.
+
+    This populates the FTS virtual table with data from the notes table.
+    Useful after database migrations or when FTS gets out of sync.
+
+    Returns:
+        Number of notes indexed.
+    """
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        # Clear existing FTS data
+        conn.execute(text("DELETE FROM notes_fts"))
+
+        # Repopulate from notes table
+        result = conn.execute(text("""
+            INSERT INTO notes_fts(rowid, id, title, content)
+            SELECT rowid, id, title, content FROM notes
+        """))
+
+        conn.commit()
+
+        # Count indexed notes
+        count_result = conn.execute(text("SELECT COUNT(*) FROM notes_fts"))
+        count = count_result.scalar()
+
+    return count
+
 
 def get_session_factory(engine=None):
     """Get a session factory for the database."""

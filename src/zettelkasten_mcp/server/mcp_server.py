@@ -360,6 +360,54 @@ class ZettelkastenMcpServer:
                 except Exception as e:
                     return self.format_error_response(e)
 
+        # Full-text search with FTS5
+        @self.mcp.tool(name="zk_fts_search")
+        def zk_fts_search(
+            query: str,
+            limit: int = 20,
+            highlight: bool = True
+        ) -> str:
+            """Full-text search using FTS5 with advanced query syntax.
+            Args:
+                query: Search query. Supports:
+                       - Simple terms: "python async"
+                       - Phrases: '"async await"'
+                       - Boolean: "python AND NOT java"
+                       - Prefix: "program*"
+                       - Column filter: "title:python"
+                limit: Maximum number of results to return
+                highlight: Include highlighted snippets in results
+            """
+            with timed_operation("zk_fts_search", query=query[:30] if query else None) as op:
+                try:
+                    if not query or not query.strip():
+                        return "Error: Search query is required."
+
+                    results = self.zettel_service.fts_search(
+                        query=query.strip(),
+                        limit=limit,
+                        highlight=highlight
+                    )
+
+                    op["result_count"] = len(results)
+
+                    if not results:
+                        return f"No notes found matching '{query}'."
+
+                    # Format results
+                    output = f"Found {len(results)} notes matching '{query}':\n\n"
+                    for i, result in enumerate(results, 1):
+                        output += f"{i}. {result['title']} (ID: {result['id']})\n"
+                        output += f"   Relevance: {abs(result['rank']):.2f}\n"
+                        if highlight and 'snippet' in result:
+                            snippet = result['snippet'].replace('\n', ' ')
+                            output += f"   Match: {snippet}\n"
+                        output += "\n"
+
+                    return output
+                except Exception as e:
+                    return self.format_error_response(e)
+
         # Get linked notes
         @self.mcp.tool(name="zk_get_linked_notes")
         def zk_get_linked_notes(
@@ -600,12 +648,12 @@ class ZettelkastenMcpServer:
         # Rebuild the index
         @self.mcp.tool(name="zk_rebuild_index")
         def zk_rebuild_index() -> str:
-            """Rebuild the database index from files."""
+            """Rebuild the database index and FTS5 search index from files."""
             try:
                 # Get count before rebuild
                 note_count_before = len(self.zettel_service.get_all_notes())
 
-                # Perform the rebuild
+                # Perform the rebuild (includes FTS5 index rebuild)
                 self.zettel_service.rebuild_index()
 
                 # Get count after rebuild
@@ -615,6 +663,7 @@ class ZettelkastenMcpServer:
                 return (
                     f"Database index rebuilt successfully.\n"
                     f"Notes processed: {note_count_after}\n"
+                    f"FTS5 search index: rebuilt\n"
                     f"Change in note count: {note_count_after - note_count_before}"
                 )
             except Exception as e:

@@ -285,6 +285,32 @@ class ZettelService:
         """
         return self.repository.sync_to_obsidian()
 
+    def fts_search(
+        self,
+        query: str,
+        limit: int = 50,
+        highlight: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Full-text search using FTS5.
+
+        Args:
+            query: Search query (supports FTS5 syntax).
+            limit: Maximum results to return.
+            highlight: Include highlighted snippets.
+
+        Returns:
+            List of search results with id, title, rank, and optionally snippet.
+        """
+        return self.repository.fts_search(query, limit, highlight)
+
+    def rebuild_fts(self) -> int:
+        """Rebuild the FTS5 index.
+
+        Returns:
+            Number of notes indexed.
+        """
+        return self.repository.rebuild_fts()
+
     def find_similar_notes(self, note_id: str, threshold: float = 0.5) -> List[Tuple[Note, float]]:
         """Find notes similar to the given note based on shared tags and links."""
         note = self.repository.get(note_id)

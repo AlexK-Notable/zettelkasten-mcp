@@ -416,3 +416,50 @@ Some content here.
         # Verify result contains health info
         assert "Zettelkasten Server Health" in result
         assert "Uptime:" in result
+
+    def test_fts_search_tool(self):
+        """Test the zk_fts_search tool."""
+        assert 'zk_fts_search' in self.registered_tools
+
+        # Set up mock search results
+        self.mock_zettel_service.fts_search.return_value = [
+            {"id": "note1", "title": "Python Guide", "rank": -1.5, "snippet": "...about <mark>python</mark>..."},
+            {"id": "note2", "title": "Async Python", "rank": -1.2, "snippet": "...<mark>python</mark> async..."},
+        ]
+
+        fts_search_func = self.registered_tools['zk_fts_search']
+        result = fts_search_func(query="python", limit=10, highlight=True)
+
+        # Verify result
+        assert "Found 2 notes" in result
+        assert "Python Guide" in result
+        assert "Async Python" in result
+        assert "Relevance:" in result
+
+        # Verify service call
+        self.mock_zettel_service.fts_search.assert_called_with(
+            query="python",
+            limit=10,
+            highlight=True
+        )
+
+    def test_fts_search_empty_query(self):
+        """Test zk_fts_search with empty query."""
+        assert 'zk_fts_search' in self.registered_tools
+
+        fts_search_func = self.registered_tools['zk_fts_search']
+        result = fts_search_func(query="", limit=10, highlight=True)
+
+        assert "Error:" in result
+        assert "query is required" in result
+
+    def test_fts_search_no_results(self):
+        """Test zk_fts_search with no matching results."""
+        assert 'zk_fts_search' in self.registered_tools
+
+        self.mock_zettel_service.fts_search.return_value = []
+
+        fts_search_func = self.registered_tools['zk_fts_search']
+        result = fts_search_func(query="nonexistent", limit=10, highlight=True)
+
+        assert "No notes found" in result
