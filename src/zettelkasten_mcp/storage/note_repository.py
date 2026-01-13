@@ -41,7 +41,18 @@ class NoteRepository(Repository[Note]):
     """
     
     def __init__(self, notes_dir: Optional[Path] = None):
-        """Initialize the repository."""
+        """Initialize the repository.
+
+        Args:
+            notes_dir: Path to directory containing note markdown files.
+                       If None, uses config.notes_dir.
+
+        Note:
+            The notes_dir should be the directory CONTAINING the .md files,
+            not the base zettelkasten directory. If you pass the base directory
+            by mistake, the health check will find 0 files and may incorrectly
+            trigger recovery.
+        """
         self.notes_dir = (
             config.get_absolute_path(notes_dir)
             if notes_dir
@@ -50,6 +61,15 @@ class NoteRepository(Repository[Note]):
 
         # Ensure directories exist
         self.notes_dir.mkdir(parents=True, exist_ok=True)
+
+        # PATH VALIDATION: Warn about common misconfigurations
+        self._validate_notes_dir()
+
+        # Log the configuration being used
+        logger.info(
+            f"NoteRepository initialized: notes_dir={self.notes_dir}, "
+            f"db_url={config.get_db_url()}"
+        )
 
         # Initialize Obsidian vault mirror (optional)
         self.obsidian_vault_path = config.get_obsidian_vault_path()
@@ -76,29 +96,93 @@ class NoteRepository(Repository[Note]):
         # Check database health and recover if needed
         self._initialize_with_health_check()
 
+    def _validate_notes_dir(self) -> None:
+        """Validate that notes_dir looks like a valid notes directory.
+
+        Logs warnings for common misconfigurations that could lead to
+        incorrect health check results or data loss during recovery.
+        """
+        # Check if this looks like a base directory rather than notes directory
+        potential_notes_subdir = self.notes_dir / "notes"
+        if potential_notes_subdir.is_dir():
+            md_files_in_subdir = len(list(potential_notes_subdir.glob("*.md")))
+            md_files_here = len(list(self.notes_dir.glob("*.md")))
+            if md_files_in_subdir > md_files_here:
+                logger.warning(
+                    f"POSSIBLE PATH ERROR: notes_dir={self.notes_dir} contains a "
+                    f"'notes' subdirectory with {md_files_in_subdir} .md files, "
+                    f"but only {md_files_here} .md files in the configured directory. "
+                    "Did you mean to use the 'notes' subdirectory?"
+                )
+
+        # Check if there's a db directory that suggests this is base dir
+        potential_db_subdir = self.notes_dir / "db"
+        if potential_db_subdir.is_dir():
+            db_files = list(potential_db_subdir.glob("*.db"))
+            if db_files:
+                logger.warning(
+                    f"POSSIBLE PATH ERROR: notes_dir={self.notes_dir} contains a "
+                    f"'db' subdirectory with database files. This suggests the "
+                    f"configured path is the base directory, not the notes directory."
+                )
+
+        # Validate database path consistency
+        db_url = config.get_db_url()
+        db_path = Path(db_url.replace("sqlite:///", ""))
+        try:
+            # Check if notes_dir and db_path share a common ancestor
+            notes_parts = self.notes_dir.resolve().parts
+            db_parts = db_path.resolve().parent.parts
+
+            # They should share at least some common path structure
+            common_depth = sum(1 for a, b in zip(notes_parts, db_parts) if a == b)
+            if common_depth < 3 and len(notes_parts) > 3 and len(db_parts) > 3:
+                logger.warning(
+                    f"POSSIBLE PATH MISMATCH: notes_dir={self.notes_dir} and "
+                    f"database path={db_path} don't appear to be related. "
+                    "The health check compares DB contents against files in notes_dir. "
+                    "If these paths are mismatched, this could cause incorrect recovery."
+                )
+        except (ValueError, OSError) as e:
+            # Path resolution failed, skip this check
+            logger.debug(f"Could not validate path consistency: {e}")
+
     def _initialize_with_health_check(self) -> None:
         """Initialize database with health check and auto-recovery.
 
-        Performs a comprehensive health check on startup. If corruption
-        is detected, automatically backs up the corrupted database and
-        rebuilds from markdown source files. Also sets FTS availability flag.
+        Performs a comprehensive health check on startup with graduated response:
+        - CRITICAL issues (corruption): Backup and rebuild entire database
+        - FTS issues: Attempt FTS-only rebuild
+        - Sync issues: Just sync index from files
+
+        This prevents over-aggressive recovery that could destroy a valid database
+        due to path misconfiguration or minor sync issues.
         """
         try:
             health = self.check_database_health()
-            if not health["healthy"]:
-                logger.warning(
-                    f"Database health check failed: {health['issues']}. "
-                    "Attempting auto-recovery..."
+
+            # Log health check results for debugging
+            logger.info(
+                f"Database health check: healthy={health['healthy']}, "
+                f"sqlite_ok={health['sqlite_ok']}, fts_ok={health['fts_ok']}, "
+                f"notes={health['note_count']}, files={health['file_count']}"
+            )
+
+            if health.get("critical_issues"):
+                # CRITICAL: Actual database corruption - must rebuild
+                logger.error(
+                    f"Critical database issues detected: {health['critical_issues']}. "
+                    f"Notes dir: {self.notes_dir}, DB: {config.get_db_url()}"
                 )
+                logger.warning("Initiating database rebuild from source files...")
                 self._nuke_and_rebuild_database()
                 logger.info("Database auto-recovery completed successfully")
-                # After rebuild, FTS should be available
                 self._fts_available = True
             else:
-                # Database is healthy, just sync if needed
-                self.rebuild_index_if_needed()
-                # Set FTS availability based on health check
+                # Database structure is OK
                 self._fts_available = health.get("fts_ok", True)
+
+                # Handle FTS issues (not critical, just rebuild FTS)
                 if not self._fts_available:
                     logger.warning(
                         "FTS5 index unhealthy but SQLite OK. "
@@ -106,11 +190,21 @@ class NoteRepository(Repository[Note]):
                     )
                     if self._attempt_fts_recovery():
                         self._fts_available = True
+
+                # Handle sync issues (just sync, don't nuke)
+                if health.get("needs_sync"):
+                    if health.get("issues"):
+                        logger.info(f"Sync needed: {health['issues']}")
+                    self.rebuild_index_if_needed()
+
         except sqlite3.DatabaseError as e:
             if "malformed" in str(e).lower() or "corrupt" in str(e).lower():
-                logger.error(f"Database corruption detected: {e}. Initiating recovery...")
+                logger.error(
+                    f"Database corruption detected during health check: {e}. "
+                    f"Notes dir: {self.notes_dir}, DB: {config.get_db_url()}"
+                )
                 self._nuke_and_rebuild_database()
-                self._fts_available = True  # Fresh rebuild includes FTS
+                self._fts_available = True
             else:
                 raise
 
@@ -118,63 +212,93 @@ class NoteRepository(Repository[Note]):
         """Perform comprehensive database health check.
 
         Checks both SQLite integrity and FTS5 index integrity.
+        Distinguishes between CRITICAL issues (corruption) and WARNING issues
+        (sync mismatches) to prevent over-aggressive recovery.
 
         Returns:
             Dict with keys:
-                - healthy: bool indicating overall health
+                - healthy: bool indicating overall health (no critical issues)
                 - sqlite_ok: bool for SQLite integrity
                 - fts_ok: bool for FTS5 integrity
                 - note_count: int of notes in database
                 - file_count: int of markdown files
-                - issues: list of issue descriptions
+                - issues: list of issue descriptions (warnings, not critical)
+                - critical_issues: list of critical issues requiring recovery
+                - needs_sync: bool indicating if sync is needed
         """
-        issues = []
+        issues = []  # Non-critical issues (warnings)
+        critical_issues = []  # Issues requiring database rebuild
         sqlite_ok = False
         fts_ok = False
         note_count = 0
         file_count = len(list(self.notes_dir.glob("*.md")))
 
+        # Log exactly what paths we're checking (crucial for debugging)
+        logger.debug(
+            f"Health check: notes_dir={self.notes_dir}, "
+            f"db_url={config.get_db_url()}"
+        )
+
         try:
             with self.session_factory() as session:
-                # Check SQLite integrity
+                # Check SQLite integrity - CRITICAL if fails
                 result = session.execute(text("PRAGMA integrity_check")).fetchone()
                 sqlite_ok = result[0] == "ok"
                 if not sqlite_ok:
-                    issues.append(f"SQLite integrity check failed: {result[0]}")
+                    critical_issues.append(
+                        f"SQLite integrity check failed: {result[0]}"
+                    )
 
                 # Get note count
-                note_count = session.scalar(
-                    select(func.count(DBNote.id))
-                )
+                note_count = session.scalar(select(func.count(DBNote.id)))
 
-                # Check FTS5 integrity (this catches FTS-specific corruption)
+                # Check FTS5 integrity - NOT critical, can be rebuilt separately
                 try:
                     session.execute(
                         text("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')")
                     )
                     fts_ok = True
-                except sqlite3.DatabaseError as e:
+                except (sqlite3.DatabaseError, SQLAlchemyDatabaseError) as e:
                     issues.append(f"FTS5 integrity check failed: {e}")
                     fts_ok = False
 
         except sqlite3.DatabaseError as e:
-            issues.append(f"Database access error: {e}")
+            critical_issues.append(f"Database access error: {e}")
             if "malformed" in str(e).lower():
-                issues.append("Database file appears to be corrupted")
+                critical_issues.append("Database file appears to be corrupted")
 
-        # Check count mismatch (potential sync issues)
-        if abs(note_count - file_count) > 0:
-            issues.append(
-                f"Note count mismatch: {note_count} in DB vs {file_count} files"
+        # Check count mismatch - this is a WARNING, not critical
+        # Small mismatches are normal during operations
+        needs_sync = False
+        if note_count != file_count:
+            mismatch_pct = (
+                abs(note_count - file_count) / max(note_count, file_count, 1) * 100
             )
+            needs_sync = True
+            # Only log as issue if significant mismatch
+            if mismatch_pct > 10 or abs(note_count - file_count) > 5:
+                issues.append(
+                    f"Note count mismatch: {note_count} in DB vs {file_count} files "
+                    f"({mismatch_pct:.1f}% difference) - will sync"
+                )
+            else:
+                logger.debug(
+                    f"Minor count mismatch: {note_count} in DB vs {file_count} files"
+                )
+
+        # Only critical issues make the database "unhealthy" (requiring rebuild)
+        # Regular issues just need sync or FTS rebuild
+        healthy = sqlite_ok and not critical_issues
 
         return {
-            "healthy": sqlite_ok and fts_ok and not issues,
+            "healthy": healthy,
             "sqlite_ok": sqlite_ok,
             "fts_ok": fts_ok,
             "note_count": note_count,
             "file_count": file_count,
-            "issues": issues
+            "issues": issues,
+            "critical_issues": critical_issues,
+            "needs_sync": needs_sync,
         }
 
     def _nuke_and_rebuild_database(self) -> str:
@@ -182,6 +306,10 @@ class NoteRepository(Repository[Note]):
 
         Creates a timestamped backup of the corrupted database, deletes it,
         reinitializes the schema, and rebuilds the index from markdown files.
+
+        CAUTION: This deletes the database! Only call when actual corruption
+        is detected (SQLite integrity check fails, malformed database error).
+        Do NOT call for simple count mismatches - use rebuild_index() instead.
 
         Returns:
             Path to the backup file.
@@ -191,21 +319,35 @@ class NoteRepository(Repository[Note]):
         """
         db_url = config.get_db_url()
         db_path = Path(db_url.replace("sqlite:///", ""))
+        file_count = len(list(self.notes_dir.glob("*.md")))
+
+        # Safety check: warn if rebuilding from very few files
+        if file_count < 5:
+            logger.warning(
+                f"REBUILD SAFETY WARNING: Only {file_count} markdown files found in "
+                f"{self.notes_dir}. If you expected more files, the notes_dir path "
+                "may be misconfigured. Database will be rebuilt from these files."
+            )
+
+        logger.info(
+            f"Starting database rebuild: db_path={db_path}, "
+            f"notes_dir={self.notes_dir}, source_files={file_count}"
+        )
 
         backup_path = None
         if db_path.exists():
-            # Create timestamped backup
+            # Create timestamped backup (labeled as backup, not "corrupted")
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_name = f"{db_path.stem}.corrupted.{timestamp}.bak"
+            backup_name = f"{db_path.stem}.backup.{timestamp}.bak"
             backup_path = db_path.parent / backup_name
 
             try:
                 shutil.copy(db_path, backup_path)
-                logger.info(f"Backed up corrupted database to: {backup_path}")
+                logger.info(f"Backed up database to: {backup_path}")
             except IOError as e:
-                logger.warning(f"Could not backup corrupted database: {e}")
+                logger.warning(f"Could not backup database: {e}")
 
-            # Delete the corrupted database and WAL files
+            # Delete the database and WAL files
             try:
                 db_path.unlink()
                 # Also remove WAL and SHM files if they exist
@@ -215,10 +357,10 @@ class NoteRepository(Repository[Note]):
                     wal_path.unlink()
                 if shm_path.exists():
                     shm_path.unlink()
-                logger.info("Deleted corrupted database files")
+                logger.info("Deleted old database files")
             except IOError as e:
                 raise DatabaseCorruptionError(
-                    f"Failed to delete corrupted database: {e}",
+                    f"Failed to delete database: {e}",
                     recovered=False,
                     backup_path=str(backup_path) if backup_path else None,
                     code=ErrorCode.DATABASE_RECOVERY_FAILED,
@@ -232,8 +374,10 @@ class NoteRepository(Repository[Note]):
 
             # Rebuild index from markdown files
             self.rebuild_index()
+            final_count = len(list(self.notes_dir.glob("*.md")))
             logger.info(
-                f"Database rebuilt successfully from {len(list(self.notes_dir.glob('*.md')))} files"
+                f"Database rebuilt successfully: indexed {final_count} files "
+                f"from {self.notes_dir}"
             )
         except Exception as e:
             raise DatabaseCorruptionError(

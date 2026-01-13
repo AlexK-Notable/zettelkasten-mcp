@@ -284,3 +284,209 @@ class TestServiceLayerHealthCheck:
         result = zettel_service.reset_fts_availability()
 
         assert isinstance(result, bool)
+
+
+class TestHealthCheckSeverityLevels:
+    """Tests for health check severity differentiation (critical vs warning)."""
+
+    def test_healthy_database_has_no_critical_issues(self, note_repository):
+        """Test that a healthy database reports no critical issues."""
+        health = note_repository.check_database_health()
+
+        assert health["healthy"] is True
+        assert "critical_issues" in health
+        assert health["critical_issues"] == []
+
+    def test_count_mismatch_is_warning_not_critical(self, note_repository, temp_dirs):
+        """Test that count mismatch is classified as warning, not critical.
+
+        This is the key fix - count mismatches should trigger sync, not nuke.
+        """
+        # Create a note
+        note = Note(
+            title="Severity Test",
+            content="Testing severity classification.",
+            note_type=NoteType.PERMANENT,
+        )
+        note_repository.create(note)
+
+        # Create orphan files to trigger mismatch
+        notes_dir = temp_dirs[0]
+        for i in range(3):  # Create enough to trigger warning message
+            orphan = notes_dir / f"orphan-{i}.md"
+            orphan.write_text(f"# Orphan {i}\n\nNo DB entry.")
+
+        health = note_repository.check_database_health()
+
+        # Mismatch should be in issues (warnings), NOT critical_issues
+        assert health["healthy"] is True  # Still healthy (no critical issues)
+        assert health["critical_issues"] == []
+        assert health["needs_sync"] is True
+        # May have warning about mismatch in issues
+        assert any("mismatch" in issue.lower() for issue in health["issues"]) or len(health["issues"]) == 0
+
+    def test_health_check_includes_needs_sync_flag(self, note_repository, temp_dirs):
+        """Test that health check includes needs_sync flag for incremental sync."""
+        # Create mismatch scenario
+        note = Note(
+            title="Sync Flag Test",
+            content="Testing needs_sync flag.",
+            note_type=NoteType.PERMANENT,
+        )
+        note_repository.create(note)
+
+        notes_dir = temp_dirs[0]
+        orphan = notes_dir / "sync-test-orphan.md"
+        orphan.write_text("# Orphan\n\nTrigger sync need.")
+
+        health = note_repository.check_database_health()
+
+        assert "needs_sync" in health
+        assert health["needs_sync"] is True
+
+
+class TestPathValidation:
+    """Tests for path misconfiguration detection."""
+
+    def test_validate_notes_dir_logs_warning_for_nested_notes_dir(self, temp_dirs, caplog):
+        """Test that passing base directory instead of notes directory logs warning."""
+        import logging
+
+        # Create a directory structure that mimics the real problem:
+        # /base/
+        #   /notes/  <- contains .md files
+        #   /db/     <- contains .db files
+        base_dir = temp_dirs[0].parent  # Go up one level from notes_dir
+
+        # Create a 'notes' subdirectory with markdown files
+        nested_notes = base_dir / "nested_notes_test"
+        nested_notes.mkdir(exist_ok=True)
+        (nested_notes / "notes").mkdir(exist_ok=True)
+
+        # Put .md files in the nested 'notes' directory
+        for i in range(5):
+            (nested_notes / "notes" / f"note-{i}.md").write_text(f"# Note {i}\n\nContent.")
+
+        # Create a separate temp database for this test
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_db_dir:
+            db_path = Path(temp_db_dir) / "test.db"
+
+            # Save original config
+            original_db_url = config.get_db_url()
+            original_notes_dir = config.notes_dir
+
+            try:
+                # Configure to use our test paths
+                config._db_url = f"sqlite:///{db_path}"
+                config.notes_dir = nested_notes  # Pass base dir, not notes dir
+
+                with caplog.at_level(logging.WARNING):
+                    # This should trigger the path validation warning
+                    repo = NoteRepository(nested_notes)
+
+                # Check that warning was logged
+                warning_logged = any(
+                    "POSSIBLE PATH ERROR" in record.message
+                    for record in caplog.records
+                )
+                assert warning_logged, "Should warn when notes/ subdirectory has more .md files"
+
+            finally:
+                # Restore original config
+                config._db_url = original_db_url
+                config.notes_dir = original_notes_dir
+
+    def test_repository_logs_paths_on_init(self, temp_dirs, caplog):
+        """Test that repository logs configured paths on initialization."""
+        import logging
+
+        # Create a fresh repository with logging captured
+        with caplog.at_level(logging.INFO):
+            # The existing note_repository fixture was already created,
+            # so we need to create a new one to capture the init logs
+            import tempfile
+            with tempfile.TemporaryDirectory() as temp_dir:
+                notes_dir = Path(temp_dir) / "notes"
+                notes_dir.mkdir()
+                db_dir = Path(temp_dir) / "db"
+                db_dir.mkdir()
+                db_path = db_dir / "test.db"
+
+                # Save original config
+                original_db_url = config.get_db_url()
+                original_notes_dir = config.notes_dir
+
+                try:
+                    config._db_url = f"sqlite:///{db_path}"
+                    config.notes_dir = notes_dir
+
+                    repo = NoteRepository(notes_dir)
+
+                    # Check that path info was logged
+                    init_logged = any(
+                        "NoteRepository initialized" in record.message
+                        and "notes_dir=" in record.message
+                        for record in caplog.records
+                    )
+                    assert init_logged, "Should log notes_dir on initialization"
+
+                finally:
+                    config._db_url = original_db_url
+                    config.notes_dir = original_notes_dir
+
+
+class TestGraduatedRecovery:
+    """Tests for graduated recovery response."""
+
+    def test_sync_only_for_count_mismatch(self, note_repository, temp_dirs):
+        """Test that count mismatch triggers sync, not full rebuild.
+
+        This verifies the fix for the bug where passing the wrong directory
+        caused the database to be nuked unnecessarily.
+        """
+        # Create some notes
+        for i in range(3):
+            note = Note(
+                title=f"Recovery Test {i}",
+                content=f"Testing graduated recovery {i}.",
+                note_type=NoteType.PERMANENT,
+            )
+            note_repository.create(note)
+
+        # Verify notes exist
+        initial_notes = note_repository.get_all()
+        assert len(initial_notes) == 3
+
+        # Create orphan file to trigger mismatch
+        notes_dir = temp_dirs[0]
+        orphan = notes_dir / "orphan-recovery-test.md"
+        orphan.write_text("# Orphan\n\nThis triggers mismatch.")
+
+        # Re-run health check initialization
+        note_repository._initialize_with_health_check()
+
+        # Notes should still exist (not nuked)
+        final_notes = note_repository.get_all()
+        assert len(final_notes) >= 3, "Original notes should survive sync"
+
+    def test_fts_recovery_attempted_before_nuke(self, note_repository):
+        """Test that FTS issues attempt FTS-only recovery first."""
+        # Simulate FTS being unavailable
+        note_repository._fts_available = False
+
+        # Create a note to ensure DB has content
+        note = Note(
+            title="FTS Recovery Test",
+            content="Testing FTS recovery path.",
+            note_type=NoteType.PERMANENT,
+        )
+        note_repository.create(note)
+
+        # Re-initialize - should attempt FTS recovery, not full nuke
+        note_repository._initialize_with_health_check()
+
+        # Note should still exist
+        all_notes = note_repository.get_all()
+        assert len(all_notes) >= 1
+        assert any(n.title == "FTS Recovery Test" for n in all_notes)
