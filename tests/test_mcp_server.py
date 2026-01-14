@@ -231,16 +231,17 @@ class TestMcpServer:
         result = self.server.format_error_response(general_error)
         assert "Error: Something went wrong" in result
 
-    def test_list_all_notes_tool(self):
-        """Test the zk_list_all_notes tool."""
+    def test_list_notes_tool(self):
+        """Test the zk_list_notes tool with mode='all'."""
         # Check the tool is registered
-        assert 'zk_list_all_notes' in self.registered_tools
+        assert 'zk_list_notes' in self.registered_tools
 
         # Set up mock notes with actual datetime values for sorting
         mock_note1 = MagicMock()
         mock_note1.id = "note1"
         mock_note1.title = "Alpha Note"
         mock_note1.note_type.value = "permanent"
+        mock_note1.project = "general"
         mock_note1.updated_at = datetime.datetime(2023, 1, 2, 14, 0)
         mock_note1.created_at = datetime.datetime(2023, 1, 2, 12, 0)
         mock_note1.tags = []
@@ -249,6 +250,7 @@ class TestMcpServer:
         mock_note2.id = "note2"
         mock_note2.title = "Beta Note"
         mock_note2.note_type.value = "fleeting"
+        mock_note2.project = "general"
         mock_note2.updated_at = datetime.datetime(2023, 1, 1, 10, 0)
         mock_note2.created_at = datetime.datetime(2023, 1, 1, 9, 0)
         mock_tag = MagicMock()
@@ -257,9 +259,9 @@ class TestMcpServer:
 
         self.mock_zettel_service.get_all_notes.return_value = [mock_note1, mock_note2]
 
-        # Call the tool function directly
-        list_notes_func = self.registered_tools['zk_list_all_notes']
-        result = list_notes_func(limit=50, offset=0, sort_by="updated_at", descending=True)
+        # Call the tool function directly with mode="all"
+        list_notes_func = self.registered_tools['zk_list_notes']
+        result = list_notes_func(mode="all", limit=50, offset=0, sort_by="updated_at", descending=True)
 
         # Verify result
         assert "Notes (1-2 of 2)" in result
@@ -270,9 +272,9 @@ class TestMcpServer:
         # Verify service call
         self.mock_zettel_service.get_all_notes.assert_called_once()
 
-    def test_list_all_notes_pagination(self):
-        """Test pagination in zk_list_all_notes."""
-        assert 'zk_list_all_notes' in self.registered_tools
+    def test_list_notes_pagination(self):
+        """Test pagination in zk_list_notes with mode='all'."""
+        assert 'zk_list_notes' in self.registered_tools
 
         # Create 5 mock notes with actual datetime values for sorting
         mock_notes = []
@@ -281,6 +283,7 @@ class TestMcpServer:
             note.id = f"note{i}"
             note.title = f"Note {i}"
             note.note_type.value = "permanent"
+            note.project = "general"
             note.updated_at = datetime.datetime(2023, 1, i + 1, 10, 0)
             note.created_at = datetime.datetime(2023, 1, i + 1, 9, 0)
             note.tags = []
@@ -288,21 +291,21 @@ class TestMcpServer:
 
         self.mock_zettel_service.get_all_notes.return_value = mock_notes
 
-        list_notes_func = self.registered_tools['zk_list_all_notes']
+        list_notes_func = self.registered_tools['zk_list_notes']
 
         # Request only first 2 notes
-        result = list_notes_func(limit=2, offset=0)
+        result = list_notes_func(mode="all", limit=2, offset=0)
         assert "Notes (1-2 of 5)" in result
         assert "Use offset=2 to see more notes" in result
 
-    def test_list_all_notes_empty(self):
-        """Test zk_list_all_notes with no notes."""
-        assert 'zk_list_all_notes' in self.registered_tools
+    def test_list_notes_empty(self):
+        """Test zk_list_notes with no notes."""
+        assert 'zk_list_notes' in self.registered_tools
 
         self.mock_zettel_service.get_all_notes.return_value = []
 
-        list_notes_func = self.registered_tools['zk_list_all_notes']
-        result = list_notes_func()
+        list_notes_func = self.registered_tools['zk_list_notes']
+        result = list_notes_func(mode="all")
 
         assert "No notes found" in result
 
@@ -393,28 +396,28 @@ Some content here.
         assert "Error:" in result
         assert "not found" in result
 
-    def test_get_metrics_tool(self):
-        """Test the zk_get_metrics tool."""
-        assert 'zk_get_metrics' in self.registered_tools
+    def test_status_metrics_tool(self):
+        """Test the zk_status tool with metrics section."""
+        assert 'zk_status' in self.registered_tools
 
-        get_metrics_func = self.registered_tools['zk_get_metrics']
-        result = get_metrics_func(include_details=False)
+        status_func = self.registered_tools['zk_status']
+        result = status_func(sections="metrics")
 
-        # Verify result contains health info
-        assert "Zettelkasten Server Health" in result
+        # Verify result contains metrics info
+        assert "Server Metrics" in result
         assert "Uptime:" in result
-        assert "Total Operations:" in result
+        assert "Operations:" in result
         assert "Success Rate:" in result
 
-    def test_get_metrics_with_details(self):
-        """Test zk_get_metrics with include_details=True."""
-        assert 'zk_get_metrics' in self.registered_tools
+    def test_status_all_sections(self):
+        """Test zk_status with all sections."""
+        assert 'zk_status' in self.registered_tools
 
-        get_metrics_func = self.registered_tools['zk_get_metrics']
-        result = get_metrics_func(include_details=True)
+        status_func = self.registered_tools['zk_status']
+        result = status_func(sections="all")
 
-        # Verify result contains health info
-        assert "Zettelkasten Server Health" in result
+        # Verify result contains status info
+        assert "Zettelkasten Status" in result
         assert "Uptime:" in result
 
     def test_fts_search_tool(self):

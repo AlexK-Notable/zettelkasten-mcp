@@ -621,23 +621,22 @@ Test content for parsing links from markdown.
         # direct testing of the MCP server output function, which is
         # handled in the next test
             
-    # Fix for test_mcp_get_linked_notes_tool
-    def test_mcp_get_linked_notes_tool(self, zettel_service):
-        """Test that zk_get_linked_notes correctly displays semantic link types."""
+    def test_mcp_find_related_linked_tool(self, zettel_service):
+        """Test that zk_find_related with mode='linked' correctly displays semantic link types."""
         # Create test notes
         central_note = zettel_service.create_note(
             title="MCP Tool Test Central Note",
-            content="Note for testing MCP get linked notes tool",
+            content="Note for testing MCP find related tool",
             note_type=NoteType.HUB,
             tags=["test", "mcp-tool"]
         )
         target_note = zettel_service.create_note(
             title="MCP Tool Test Target Note",
-            content="Target for testing MCP get linked notes tool",
+            content="Target for testing MCP find related tool",
             note_type=NoteType.PERMANENT,
             tags=["test", "mcp-tool"]
         )
-        
+
         # Create link with semantic type
         zettel_service.create_link(
             source_id=central_note.id,
@@ -645,24 +644,28 @@ Test content for parsing links from markdown.
             link_type=LinkType.EXTENDS,
             description="Testing extends relationship"
         )
-        
+
         # Create MCP server
         server = ZettelkastenMcpServer()
         server.zettel_service = zettel_service
-        
-        # Access the tool function directly as a method of the server
-        result = server.zk_get_linked_notes(
+
+        # Access the zk_find_related tool through the tool manager
+        tool = server.mcp._tool_manager.get_tool("zk_find_related")
+        assert tool is not None, "zk_find_related tool not found"
+        find_related_func = tool.fn
+
+        result = find_related_func(
             note_id=central_note.id,
+            mode="linked",
             direction="outgoing"
         )
-        
-        # Verify result contains correct link type
-        assert "Found" in result
-        assert "linked notes for " + central_note.id in result
+
+        # Verify result contains correct link info
+        assert "linked" in result.lower()
+        assert "MCP Tool Test Target Note" in result
         assert "Link type: extends" in result
         assert "Testing extends relationship" in result
 
-    # Fix for test_mcp_create_link_tool
     def test_mcp_create_link_tool(self, zettel_service):
         """Test that zk_create_link correctly creates links with semantic types."""
         # Create test notes
@@ -678,33 +681,37 @@ Test content for parsing links from markdown.
             note_type=NoteType.PERMANENT,
             tags=["test", "mcp-create-link"]
         )
-        
-        # Create MCP server with mocked functions
+
+        # Create MCP server
         server = ZettelkastenMcpServer()
-        server.zettel_service = zettel_service  # Use our test zettel_service
-        
-        # Call the tool function directly as a method of the server
-        result = server.zk_create_link(
+        server.zettel_service = zettel_service
+
+        # Access the zk_create_link tool through the tool manager
+        tool = server.mcp._tool_manager.get_tool("zk_create_link")
+        assert tool is not None, "zk_create_link tool not found"
+        create_link_func = tool.fn
+
+        result = create_link_func(
             source_id=source_note.id,
             target_id=target_note.id,
             link_type="supports",
             description="Testing supports relationship via MCP tool",
             bidirectional=True
         )
-        
+
         # Verify link was created with correct type
         assert "Bidirectional link created" in result
-        
+
         # Verify link through repository
         updated_source = zettel_service.get_note(source_note.id)
         updated_target = zettel_service.get_note(target_note.id)
-        
+
         # Check source note's links
         source_links = [link for link in updated_source.links if link.target_id == target_note.id]
         assert len(source_links) == 1
         assert source_links[0].link_type == LinkType.SUPPORTS
         assert source_links[0].description == "Testing supports relationship via MCP tool"
-        
+
         # Check target note's links (inverse relationship)
         target_links = [link for link in updated_target.links if link.target_id == source_note.id]
         assert len(target_links) == 1
