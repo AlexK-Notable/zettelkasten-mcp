@@ -173,25 +173,35 @@ class TestHelperFunctions:
     """Tests for helper functions in the schema module."""
 
     def test_iso8601_id_format(self):
-        """Test that generated IDs follow the correct ISO 8601 format with nanosecond precision."""
+        """Test that generated IDs follow the correct ISO 8601 format with microsecond + counter.
+
+        Format: YYYYMMDDTHHMMSSsssssscccccc (27 characters)
+        - YYYYMMDD: 8-digit date
+        - T: ISO 8601 separator
+        - HHMMSS: 6-digit time
+        - ssssss: 6-digit microseconds
+        - cccccc: 6-digit counter for uniqueness within same microsecond
+        """
         # Generate an ID
         id_str = generate_id()
-        
-        # Verify it matches the expected format: YYYYMMDDTHHMMSSsssssssss
-        # Where sssssssss is a 9-digit nanosecond component
-        pattern = r'^\d{8}T\d{6}\d{9}$'
-        assert re.match(pattern, id_str), f"ID {id_str} does not match expected ISO 8601 basic format"
-        
+
+        # Verify it matches the expected format: YYYYMMDDTHHMMSSsssssscccccc (27 chars)
+        pattern = r'^\d{8}T\d{6}\d{12}$'  # 8 + T + 6 + 12 = 27 chars
+        assert re.match(pattern, id_str), f"ID {id_str} does not match expected ISO 8601 format"
+
         # Verify the parts make sense
         date_part = id_str[:8]
         separator = id_str[8]
         time_part = id_str[9:15]
-        ns_part = id_str[15:]
-        
+        microseconds_part = id_str[15:21]
+        counter_part = id_str[21:]
+
         assert len(date_part) == 8, "Date part should be 8 digits (YYYYMMDD)"
         assert separator == 'T', "Date/time separator should be 'T' per ISO 8601"
         assert len(time_part) == 6, "Time part should be 6 digits (HHMMSS)"
-        assert len(ns_part) == 9, "Nanosecond part should be 9 digits"
+        assert len(microseconds_part) == 6, "Microseconds part should be 6 digits"
+        assert len(counter_part) == 6, "Counter part should be 6 digits"
+        assert len(id_str) == 27, f"Total ID length should be 27 chars, got {len(id_str)}"
 
     def test_iso8601_uniqueness(self):
         """Test that ISO 8601 IDs with nanosecond precision are unique even in rapid succession."""

@@ -9,7 +9,7 @@ import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -42,7 +42,7 @@ class MetricsCollector:
     def __init__(self):
         self._metrics: Dict[str, OperationMetrics] = defaultdict(OperationMetrics)
         self._lock = Lock()
-        self._start_time = datetime.now()
+        self._start_time = datetime.now(timezone.utc)
 
     def record_operation(
         self,
@@ -71,7 +71,7 @@ class MetricsCollector:
             else:
                 m.error_count += 1
                 m.last_error = error
-                m.last_error_time = datetime.now()
+                m.last_error_time = datetime.now(timezone.utc)
 
     def get_metrics(self) -> Dict[str, Dict[str, Any]]:
         """Get a snapshot of all metrics.
@@ -110,7 +110,7 @@ class MetricsCollector:
             total_errors = sum(m.error_count for m in self._metrics.values())
 
             return {
-                'uptime_seconds': (datetime.now() - self._start_time).total_seconds(),
+                'uptime_seconds': (datetime.now(timezone.utc) - self._start_time).total_seconds(),
                 'total_operations': total_ops,
                 'total_success': total_success,
                 'total_errors': total_errors,
@@ -122,7 +122,7 @@ class MetricsCollector:
         """Reset all metrics (useful for testing)."""
         with self._lock:
             self._metrics.clear()
-            self._start_time = datetime.now()
+            self._start_time = datetime.now(timezone.utc)
 
 
 # Global metrics collector instance
@@ -227,7 +227,7 @@ def log_context(**context) -> Dict[str, Any]:
         logger.info("Note created", extra=log_context(note_id=note.id, title=note.title))
     """
     return {
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         **context
     }
 

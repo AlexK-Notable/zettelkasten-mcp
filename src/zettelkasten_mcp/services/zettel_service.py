@@ -1,5 +1,6 @@
 """Service layer for Zettelkasten operations."""
 import datetime
+from datetime import timezone
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -104,7 +105,7 @@ class ZettelService:
         if metadata is not None:
             note.metadata = metadata
 
-        note.updated_at = datetime.datetime.now()
+        note.updated_at = datetime.datetime.now(timezone.utc)
 
         # Save to repository
         return self.repository.update(note)

@@ -1,7 +1,9 @@
 """Repository for note storage and retrieval."""
 import datetime
+from datetime import timezone
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -20,7 +22,10 @@ from zettelkasten_mcp.config import config
 from zettelkasten_mcp.models.db_models import (Base, DBLink, DBNote, DBTag,
                                             get_session_factory, init_db,
                                             note_tags, rebuild_fts_index)
-from zettelkasten_mcp.models.schema import Link, LinkType, Note, NoteType, Tag, validate_safe_path_component
+from zettelkasten_mcp.models.schema import (
+    Link, LinkType, Note, NoteType, Tag, validate_safe_path_component,
+    utc_now, ensure_timezone_aware
+)
 from zettelkasten_mcp.storage.base import Repository
 from zettelkasten_mcp.exceptions import (
     BulkOperationError,
@@ -36,7 +41,7 @@ class NoteRepository(Repository[Note]):
     """Repository for note storage and retrieval.
     This implements a dual storage approach:
     1. Notes are stored as Markdown files on disk for human readability and editing
-    2. MySQL database is used for indexing and efficient querying
+    2. SQLite database (with WAL mode) is used for indexing and efficient querying
     The file system is the source of truth - database is rebuilt from files if needed.
     """
     
@@ -93,6 +98,9 @@ class NoteRepository(Repository[Note]):
         # FTS5 availability tracking - allows graceful degradation when corrupted
         self._fts_available: bool = True
 
+        # Clean up any orphaned staging files from previous failed operations
+        self._cleanup_staging()
+
         # Check database health and recover if needed
         self._initialize_with_health_check()
 
@@ -146,6 +154,41 @@ class NoteRepository(Repository[Note]):
         except (ValueError, OSError) as e:
             # Path resolution failed, skip this check
             logger.debug(f"Could not validate path consistency: {e}")
+
+    def _cleanup_staging(self) -> None:
+        """Clean up orphaned staging files from previous failed operations.
+
+        Called during __init__ to ensure the staging directory is clean.
+        This handles the case where a previous bulk operation crashed after
+        writing staging files but before moving them to final locations.
+
+        The staging directory (.staging) is used by bulk_create_notes() to
+        achieve atomic file operations - files are written to staging first,
+        then atomically moved to their final location after DB commit succeeds.
+        """
+        staging_dir = self.notes_dir / ".staging"
+        if not staging_dir.exists():
+            return
+
+        orphaned_files = list(staging_dir.glob("*.md"))
+        if orphaned_files:
+            logger.warning(
+                f"Found {len(orphaned_files)} orphaned staging files from previous "
+                f"failed operation. Cleaning up..."
+            )
+            for file_path in orphaned_files:
+                try:
+                    file_path.unlink()
+                    logger.debug(f"Removed orphaned staging file: {file_path.name}")
+                except OSError as e:
+                    logger.warning(f"Failed to remove orphaned staging file {file_path.name}: {e}")
+
+            # Try to remove the staging directory if empty
+            try:
+                staging_dir.rmdir()
+            except OSError:
+                # Directory not empty or other error - ignore
+                pass
 
     def _initialize_with_health_check(self) -> None:
         """Initialize database with health check and auto-recovery.
@@ -337,7 +380,7 @@ class NoteRepository(Repository[Note]):
         backup_path = None
         if db_path.exists():
             # Create timestamped backup (labeled as backup, not "corrupted")
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
             backup_name = f"{db_path.stem}.backup.{timestamp}.bak"
             backup_path = db_path.parent / backup_name
 
@@ -423,58 +466,154 @@ class NoteRepository(Repository[Note]):
             self.rebuild_index()
     
     def rebuild_index(self) -> None:
-        """Rebuild the database index from all markdown files."""
-        # Clear the database first
+        """Rebuild the database index from markdown files using incremental sync.
+
+        This method is crash-safe: instead of deleting all records and rebuilding
+        from scratch, it performs an incremental sync:
+
+        1. Identifies orphaned DB entries (notes in DB but not on disk) and removes them
+        2. Upserts all notes from disk files (updates existing, inserts new)
+        3. All operations happen in a single transaction for atomicity
+
+        If a crash occurs during rebuild, the database remains in a consistent state
+        (either pre-rebuild or post-rebuild, never half-rebuilt with empty tables).
+
+        Note:
+            Files that fail to parse are logged and skipped, but do not abort the
+            entire rebuild operation.
+        """
         with self.session_factory() as session:
-            # Delete all records from link table
-            session.execute(text("DELETE FROM links"))
-            # Delete all records from note_tags table
-            session.execute(text("DELETE FROM note_tags"))
-            # Delete all records from notes table
-            session.execute(text("DELETE FROM notes"))
-            # Commit changes
-            session.commit()
-        
-        # Read all markdown files
-        note_files = list(self.notes_dir.glob("*.md"))
-        
-        # Process files in batches to avoid memory issues with large Zettelkasten systems
-        batch_size = 100
-        for i in range(0, len(note_files), batch_size):
-            batch = note_files[i:i + batch_size]
-            notes = []
-            
-            # Read files - track failures for user feedback
+            # Step 1: Get existing note IDs from database
+            db_ids = {row[0] for row in session.execute(text("SELECT id FROM notes"))}
+
+            # Step 2: Get note IDs from files on disk
+            file_ids = {p.stem for p in self.notes_dir.glob("*.md")}
+
+            # Step 3: Delete orphaned DB entries (notes in DB but files deleted)
+            orphaned = db_ids - file_ids
+            if orphaned:
+                logger.info(f"Removing {len(orphaned)} orphaned database entries")
+                # SQLite doesn't support tuple binding directly for IN clauses
+                # Use individual deletes in a batch for safety
+                for orphan_id in orphaned:
+                    session.execute(
+                        text("DELETE FROM links WHERE source_id = :id OR target_id = :id"),
+                        {"id": orphan_id}
+                    )
+                    session.execute(
+                        text("DELETE FROM note_tags WHERE note_id = :id"),
+                        {"id": orphan_id}
+                    )
+                    session.execute(
+                        text("DELETE FROM notes WHERE id = :id"),
+                        {"id": orphan_id}
+                    )
+
+            # Step 4: Upsert from files (process in batches for memory efficiency)
+            note_files = list(self.notes_dir.glob("*.md"))
+            batch_size = 100
+            total_processed = 0
             failed_files: List[str] = []
-            for file_path in batch:
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    note = self._parse_note_from_markdown(content)
-                    notes.append(note)
-                except (IOError, OSError) as e:
-                    # File access errors - log and continue
-                    logger.error(f"Cannot read file {file_path.name}: {e}")
-                    failed_files.append(file_path.name)
-                except (ValueError, yaml.YAMLError) as e:
-                    # Malformed frontmatter or missing required fields
-                    logger.error(f"Invalid note format in {file_path.name}: {e}")
-                    failed_files.append(file_path.name)
-                # Let other exceptions (MemoryError, KeyboardInterrupt, bugs) propagate
+
+            for i in range(0, len(note_files), batch_size):
+                batch = note_files[i:i + batch_size]
+
+                for file_path in batch:
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        note = self._parse_note_from_markdown(content)
+                        # Upsert within the same session (no individual commits)
+                        self._upsert_note_in_session(session, note)
+                        total_processed += 1
+                    except (IOError, OSError) as e:
+                        # File access errors - log and continue
+                        logger.error(f"Cannot read file {file_path.name}: {e}")
+                        failed_files.append(file_path.name)
+                    except (ValueError, yaml.YAMLError) as e:
+                        # Malformed frontmatter or missing required fields
+                        logger.error(f"Invalid note format in {file_path.name}: {e}")
+                        failed_files.append(file_path.name)
+                    # Let other exceptions (MemoryError, KeyboardInterrupt, bugs) propagate
 
             if failed_files:
                 logger.warning(
-                    f"Failed to process {len(failed_files)} files in batch: "
+                    f"Failed to process {len(failed_files)} files: "
                     f"{failed_files[:5]}{'...' if len(failed_files) > 5 else ''}"
                 )
-            
-            # Index notes
-            for note in notes:
-                self._index_note(note)
+
+            # Step 5: Commit all changes atomically
+            session.commit()
+            logger.info(
+                f"Incremental rebuild complete: {total_processed} notes indexed, "
+                f"{len(orphaned)} orphans removed, {len(failed_files)} files failed"
+            )
 
         # Rebuild FTS5 index to ensure full-text search is in sync
         fts_count = self.rebuild_fts()
         logger.info(f"Rebuilt FTS5 index with {fts_count} notes")
+
+    def _upsert_note_in_session(self, session: Session, note: Note) -> None:
+        """Upsert a note within an existing session (no commit).
+
+        This is used by rebuild_index() to batch multiple upserts into a single
+        transaction. Unlike _index_note(), this method does not create its own
+        session or commit - it operates within the provided session.
+
+        Args:
+            session: The SQLAlchemy session to use.
+            note: The Note object to upsert.
+        """
+        # Check if note exists
+        db_note = session.scalar(select(DBNote).where(DBNote.id == note.id))
+
+        if db_note:
+            # Update existing note
+            db_note.title = note.title
+            db_note.content = note.content
+            db_note.note_type = note.note_type.value
+            db_note.updated_at = note.updated_at
+            db_note.project = note.project
+            # Clear existing links and tags to rebuild them
+            session.execute(
+                text("DELETE FROM links WHERE source_id = :note_id"),
+                {"note_id": note.id}
+            )
+            session.execute(
+                text("DELETE FROM note_tags WHERE note_id = :note_id"),
+                {"note_id": note.id}
+            )
+        else:
+            # Create new note
+            db_note = DBNote(
+                id=note.id,
+                title=note.title,
+                content=note.content,
+                note_type=note.note_type.value,
+                created_at=note.created_at,
+                updated_at=note.updated_at,
+                project=note.project
+            )
+            session.add(db_note)
+
+        session.flush()  # Flush to ensure note exists before adding relationships
+
+        # Add tags (using atomic get-or-create)
+        for tag in note.tags:
+            db_tag = self._get_or_create_tag(session, tag.name)
+            if db_tag not in db_note.tags:
+                db_note.tags.append(db_tag)
+
+        # Add links
+        for link in note.links:
+            db_link = DBLink(
+                source_id=link.source_id,
+                target_id=link.target_id,
+                link_type=link.link_type.value,
+                description=link.description,
+                created_at=link.created_at
+            )
+            session.add(db_link)
     
     def _parse_note_from_markdown(self, content: str) -> Note:
         """Parse a note from markdown content."""
@@ -571,7 +710,7 @@ class NoteRepository(Repository[Note]):
                                 target_id=target_id,
                                 link_type=link_type,
                                 description=description,
-                                created_at=datetime.datetime.now()
+                                created_at=utc_now()
                             )
                         )
                 except (ValueError, IndexError) as e:
@@ -584,7 +723,7 @@ class NoteRepository(Repository[Note]):
         created_at = (
             datetime.datetime.fromisoformat(created_str)
             if created_str
-            else datetime.datetime.now()
+            else utc_now()
         )
         updated_str = metadata.get("updated")
         updated_at = (
@@ -1028,7 +1167,7 @@ class NoteRepository(Repository[Note]):
                 self._delete_from_obsidian(note.id, existing_note.title, existing_note.project)
 
             # Update timestamp
-            note.updated_at = datetime.datetime.now()
+            note.updated_at = utc_now()
 
             # Convert note to markdown
             markdown = self._note_to_markdown(note)
@@ -1288,11 +1427,72 @@ class NoteRepository(Repository[Note]):
             result = session.execute(query)
             return result.scalar() or 0
 
+    def _should_escape_fts5_query(self, query: str) -> bool:
+        """Auto-detect if query should be escaped for literal matching.
+
+        Analyzes the query to determine if it appears to use intentional
+        FTS5 syntax (operators, phrases, wildcards) or if it should be
+        treated as a literal search string.
+
+        Args:
+            query: The search query to analyze.
+
+        Returns:
+            True if the query should be escaped (literal matching),
+            False if it appears to use intentional FTS5 syntax.
+        """
+        FTS5_KEYWORDS = {'AND', 'OR', 'NOT', 'NEAR'}
+
+        # Check for intentional FTS5 boolean operators
+        words = query.upper().split()
+        if any(kw in words for kw in FTS5_KEYWORDS):
+            return False
+
+        # Check for phrase quotes (at least a pair of quotes)
+        if query.count('"') >= 2:
+            return False
+
+        # Check for prefix wildcards (word ending with *)
+        if re.search(r'\b\w+\*', query):
+            return False
+
+        # Check for column filters (e.g., title:python)
+        if re.search(r'\b\w+:', query):
+            return False
+
+        # Default: escape for literal matching
+        return True
+
+    def _escape_fts5_query(self, query: str) -> str:
+        """Escape FTS5 special characters for literal matching.
+
+        Transforms the query so that FTS5 operators and special characters
+        are treated as literal text rather than query syntax.
+
+        Args:
+            query: The search query to escape.
+
+        Returns:
+            Escaped query safe for FTS5 literal matching.
+        """
+        # Escape double quotes
+        result = query.replace('"', '""')
+
+        # Remove wildcards and boost operators that could cause syntax errors
+        result = re.sub(r'[*^]', '', result)
+
+        # Wrap FTS5 keywords in quotes to literalize them
+        for kw in ['AND', 'OR', 'NOT', 'NEAR']:
+            result = re.sub(rf'\b{kw}\b', f'"{kw}"', result, flags=re.IGNORECASE)
+
+        return result
+
     def fts_search(
         self,
         query: str,
         limit: int = 50,
-        highlight: bool = False
+        highlight: bool = False,
+        literal: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """Full-text search using SQLite FTS5 with graceful degradation.
 
@@ -1309,6 +1509,11 @@ class NoteRepository(Repository[Note]):
                    Note: Complex syntax (NEAR, parentheses) may require escaping.
             limit: Maximum number of results to return.
             highlight: If True, include highlighted snippets in results.
+            literal: Controls query escaping behavior:
+                     - None (default): Auto-detect based on query content.
+                       Escapes unless FTS5 operators/syntax detected.
+                     - True: Force literal matching (escape all operators).
+                     - False: Preserve FTS5 syntax (minimal escaping).
 
         Returns:
             List of dicts with keys:
@@ -1326,9 +1531,17 @@ class NoteRepository(Repository[Note]):
         results = []
 
         with self.session_factory() as session:
-            # Escape the query for FTS5 (basic escaping)
-            # FTS5 uses double quotes for phrases
-            safe_query = query.replace('"', '""')
+            # Smart query escaping based on literal parameter
+            # Auto-detect if not explicitly specified
+            if literal is None:
+                literal = self._should_escape_fts5_query(query)
+
+            if literal:
+                # Escape FTS5 operators for literal matching
+                safe_query = self._escape_fts5_query(query)
+            else:
+                # Minimal escaping - preserve FTS5 syntax
+                safe_query = query.replace('"', '""')
 
             if highlight:
                 # Query with highlighted snippets
@@ -1688,10 +1901,18 @@ class NoteRepository(Repository[Note]):
     # ========== Bulk Operations ==========
 
     def bulk_create_notes(self, notes: List[Note]) -> List[Note]:
-        """Create multiple notes in a single batch operation.
+        """Create multiple notes in a single atomic batch operation.
 
-        All notes are created atomically - if any fails, all are rolled back.
-        Uses a single lock for the entire operation to prevent race conditions.
+        Uses a staged file write pattern for true atomicity:
+        1. Write files to a .staging subdirectory first
+        2. Commit all database changes in a single transaction
+        3. Atomically move files from staging to final location
+        4. On any failure, only staging files need cleanup (DB auto-rollbacks)
+
+        This ensures that either ALL notes are created successfully (files exist
+        AND database records exist), or NONE are (clean rollback). The staging
+        directory pattern prevents partial states where files exist but DB
+        records don't, or vice versa.
 
         Args:
             notes: List of Note objects to create.
@@ -1714,13 +1935,15 @@ class NoteRepository(Repository[Note]):
         from zettelkasten_mcp.models.schema import generate_id
 
         created_notes = []
-        file_paths_created = []
-        # Track Obsidian mirrors for rollback
-        obsidian_notes_created = []  # List of (note_id, title, project) tuples
+        staged_files: List[Tuple[Path, Path]] = []  # (staging_path, final_path) pairs
+        staging_dir = self.notes_dir / ".staging"
 
         # Use a single lock for the entire bulk operation to prevent race conditions
         with self.file_lock:
             try:
+                # === Phase 1: Write files to staging directory ===
+                staging_dir.mkdir(exist_ok=True)
+
                 for note in notes:
                     # Ensure the note has an ID
                     if not note.id:
@@ -1729,21 +1952,17 @@ class NoteRepository(Repository[Note]):
                     # Convert note to markdown
                     markdown = self._note_to_markdown(note)
 
-                    # Write to file
-                    file_path = self.notes_dir / f"{note.id}.md"
-                    with open(file_path, "w", encoding="utf-8") as f:
+                    # Write to staging directory first
+                    staging_path = staging_dir / f"{note.id}.md"
+                    final_path = self.notes_dir / f"{note.id}.md"
+
+                    with open(staging_path, "w", encoding="utf-8") as f:
                         f.write(markdown)
-                    file_paths_created.append(file_path)
 
-                    # Mirror to Obsidian vault if configured
-                    self._mirror_to_obsidian(note, markdown)
-                    # Track for potential rollback
-                    if self.obsidian_vault_path:
-                        obsidian_notes_created.append((note.id, note.title, note.project))
-
+                    staged_files.append((staging_path, final_path))
                     created_notes.append(note)
 
-                # Index all notes in database in a single session
+                # === Phase 2: Commit all database changes atomically ===
                 with self.session_factory() as session:
                     for note in created_notes:
                         # Create database record
@@ -1774,26 +1993,56 @@ class NoteRepository(Repository[Note]):
                             )
                             session.add(db_link)
 
+                    # This is the commit point - if this fails, DB auto-rollbacks
                     session.commit()
 
-                logger.info(f"Bulk created {len(created_notes)} notes")
+                # === Phase 3: Atomically move staged files to final location ===
+                # DB commit succeeded, now move files (this should rarely fail)
+                for staging_path, final_path in staged_files:
+                    try:
+                        # POSIX atomic rename (same filesystem)
+                        staging_path.rename(final_path)
+                    except OSError:
+                        # Cross-filesystem fallback
+                        import shutil
+                        shutil.move(str(staging_path), str(final_path))
+
+                # === Phase 4: Mirror to Obsidian (best-effort, non-critical) ===
+                for note in created_notes:
+                    try:
+                        markdown = self._note_to_markdown(note)
+                        self._mirror_to_obsidian(note, markdown)
+                    except Exception as obsidian_error:
+                        # Log but don't fail - Obsidian mirroring is optional
+                        logger.warning(
+                            f"Failed to mirror note {note.id} to Obsidian: {obsidian_error}"
+                        )
+
+                # Clean up staging directory if empty
+                try:
+                    staging_dir.rmdir()
+                except OSError:
+                    pass  # Not empty or other issue - ignore
+
+                logger.info(f"Bulk created {len(created_notes)} notes atomically")
                 return created_notes
 
             except Exception as e:
-                # Rollback: delete any files we created
-                for file_path in file_paths_created:
+                # Rollback: only need to clean staging files
+                # (DB auto-rollbacks if commit didn't succeed)
+                for staging_path, _ in staged_files:
                     try:
-                        if file_path.exists():
-                            os.remove(file_path)
-                    except IOError as cleanup_error:
-                        logger.warning(f"Failed to cleanup file {file_path}: {cleanup_error}")
+                        if staging_path.exists():
+                            staging_path.unlink()
+                    except OSError as cleanup_error:
+                        logger.warning(f"Failed to cleanup staging file {staging_path}: {cleanup_error}")
 
-                # Rollback: delete any Obsidian mirrors we created
-                for note_id, title, project in obsidian_notes_created:
-                    try:
-                        self._delete_from_obsidian(note_id, title, project)
-                    except Exception as cleanup_error:
-                        logger.warning(f"Failed to cleanup Obsidian mirror for {note_id}: {cleanup_error}")
+                # Try to remove staging directory
+                try:
+                    if staging_dir.exists():
+                        staging_dir.rmdir()
+                except OSError:
+                    pass  # Not empty or other issue - ignore
 
                 logger.error(f"Bulk create failed, rolled back: {e}")
                 raise BulkOperationError(
@@ -1959,7 +2208,7 @@ class NoteRepository(Repository[Note]):
                             tags_added = True
 
                     if tags_added:
-                        db_note.updated_at = datetime.datetime.now()
+                        db_note.updated_at = utc_now()
                         updated_count += 1
 
                         # Get note for file update (defer file write until after commit)
@@ -2078,7 +2327,7 @@ class NoteRepository(Repository[Note]):
 
                     # Only update if tags were actually removed
                     if len(db_note.tags) < original_count:
-                        db_note.updated_at = datetime.datetime.now()
+                        db_note.updated_at = utc_now()
                         updated_count += 1
 
                         # Get note for file update (defer file write until after commit)
@@ -2205,7 +2454,7 @@ class NoteRepository(Repository[Note]):
 
                         # Update database
                         db_note.project = project
-                        db_note.updated_at = datetime.datetime.now()
+                        db_note.updated_at = utc_now()
                         updated_count += 1
                     else:
                         # Note already in target project - still counts as "processed"
@@ -2227,7 +2476,7 @@ class NoteRepository(Repository[Note]):
 
                     # Update note's project
                     note.project = project
-                    note.updated_at = datetime.datetime.now()
+                    note.updated_at = utc_now()
 
                     # Write updated markdown file
                     markdown = self._note_to_markdown(note)

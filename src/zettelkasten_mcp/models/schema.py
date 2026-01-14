@@ -2,7 +2,7 @@
 import sys
 import time
 import datetime
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone
 import random
 import inspect
 from enum import Enum
@@ -53,30 +53,59 @@ def validate_safe_path_component(value: str, field_name: str = "value") -> str:
 
     return value
 
+
+def utc_now() -> datetime.datetime:
+    """Get current UTC time as timezone-aware datetime.
+
+    Returns:
+        Current time with UTC timezone info attached.
+    """
+    return datetime.datetime.now(timezone.utc)
+
+
+def ensure_timezone_aware(dt_value: datetime.datetime) -> datetime.datetime:
+    """Ensure a datetime is timezone-aware, treating naive datetimes as UTC.
+
+    This is used for migration compatibility: existing naive datetimes in the
+    database are assumed to be UTC.
+
+    Args:
+        dt_value: A datetime that may or may not have timezone info.
+
+    Returns:
+        The same datetime with UTC timezone if it was naive, otherwise unchanged.
+    """
+    if dt_value is None:
+        return utc_now()
+    if dt_value.tzinfo is None:
+        return dt_value.replace(tzinfo=timezone.utc)
+    return dt_value
+
+
 # Thread-safe counter for uniqueness
 _id_lock = threading.Lock()
 _last_timestamp = 0
 _counter = 0
 
 def generate_id() -> str:
-    """Generate an ISO 8601 compliant timestamp-based ID with guaranteed uniqueness (pseudo-nanosecond precision).
-    
+    """Generate an ISO 8601 compliant timestamp-based ID with guaranteed uniqueness.
+
     Returns:
-        A string in format "YYYYMMDDTHHMMSSssssssccc" where:
+        A string in format "YYYYMMDDTHHMMSSsssssscccccc" where:
         - YYYYMMDD is the date
         - T is the ISO 8601 date/time separator
         - HHMMSS is the time (hours, minutes, seconds)
-        - ssssss is the 6-digit microsecond component (from time.time())
-        - ccc is a 3-digit counter for uniqueness within the same microsecond
-        
+        - ssssss is the 6-digit microsecond component
+        - cccccc is a 6-digit counter for uniqueness within the same microsecond
+
     The format follows ISO 8601 basic format with extended precision,
-    allowing up to 1 billion unique IDs per second.
+    allowing up to 1 trillion unique IDs per second (1 million per microsecond).
     """
     global _last_timestamp, _counter
 
     with _id_lock:
-        # Get current timestamp with microsecond precision
-        now = datetime.datetime.now()
+        # Get current timestamp with microsecond precision (UTC for consistency)
+        now = utc_now()
         # Create a timestamp in microseconds
         current_timestamp = int(now.timestamp() * 1_000_000)
 
@@ -87,14 +116,14 @@ def generate_id() -> str:
             _last_timestamp = current_timestamp
             _counter = 0
 
-        # Ensure counter doesn't overflow our 3 digits
-        _counter %= 1000
+        # Ensure counter doesn't overflow our 6 digits (supports 1M IDs/microsecond)
+        _counter %= 1_000_000
 
         # Format as ISO 8601 basic format with microseconds and counter
         date_time = now.strftime('%Y%m%dT%H%M%S')
         microseconds = now.microsecond
 
-        return f"{date_time}{microseconds:06d}{_counter:03d}"
+        return f"{date_time}{microseconds:06d}{_counter:06d}"
 
 class LinkType(str, Enum):
     """Types of links between notes."""
@@ -118,8 +147,8 @@ class Link(BaseModel):
     link_type: LinkType = Field(default=LinkType.REFERENCE, description="Type of link")
     description: Optional[str] = Field(default=None, description="Optional description of the link")
     created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now,
-        description="When the link was created"
+        default_factory=utc_now,
+        description="When the link was created (UTC)"
     )
     
     model_config = {
@@ -159,12 +188,12 @@ class Note(BaseModel):
     tags: List[Tag] = Field(default_factory=list, description="Tags for categorization")
     links: List[Link] = Field(default_factory=list, description="Links to other notes")
     created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now,
-        description="When the note was created"
+        default_factory=utc_now,
+        description="When the note was created (UTC)"
     )
     updated_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now,
-        description="When the note was last updated"
+        default_factory=utc_now,
+        description="When the note was last updated (UTC)"
     )
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
@@ -207,13 +236,13 @@ class Note(BaseModel):
         tag_names = {t.name for t in self.tags}
         if tag.name not in tag_names:
             self.tags.append(tag)
-            self.updated_at = datetime.datetime.now()
+            self.updated_at = utc_now()
     
     def remove_tag(self, tag: Union[str, Tag]) -> None:
         """Remove a tag from the note."""
         tag_name = tag.name if isinstance(tag, Tag) else tag
         self.tags = [t for t in self.tags if t.name != tag_name]
-        self.updated_at = datetime.datetime.now()
+        self.updated_at = utc_now()
     
     def add_link(self, target_id: str, link_type: LinkType = LinkType.REFERENCE, 
                 description: Optional[str] = None) -> None:
@@ -229,7 +258,7 @@ class Note(BaseModel):
             description=description
         )
         self.links.append(link)
-        self.updated_at = datetime.datetime.now()
+        self.updated_at = utc_now()
     
     def remove_link(self, target_id: str, link_type: Optional[LinkType] = None) -> None:
         """Remove a link to another note."""
@@ -240,7 +269,7 @@ class Note(BaseModel):
             ]
         else:
             self.links = [link for link in self.links if link.target_id != target_id]
-        self.updated_at = datetime.datetime.now()
+        self.updated_at = utc_now()
     
     def get_linked_note_ids(self) -> Set[str]:
         """Get all note IDs that this note links to."""
